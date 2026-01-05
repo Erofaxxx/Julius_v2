@@ -1,0 +1,32 @@
+[Unit]
+Description=CSV Analysis Agent API Server
+After=network.target
+
+[Service]
+Type=simple
+User=csvagent
+Group=csvagent
+WorkingDirectory=/home/csvagent/Claude_code
+Environment="PATH=/home/csvagent/Claude_code/venv/bin"
+
+# Для простого запуска через uvicorn (для тестирования)
+# ExecStart=/home/csvagent/Claude_code/venv/bin/python api_server.py
+
+# Для production с Gunicorn (рекомендуется)
+ExecStart=/home/csvagent/Claude_code/venv/bin/gunicorn api_server:app \
+    --workers 4 \
+    --worker-class uvicorn.workers.UvicornWorker \
+    --bind 0.0.0.0:8000 \
+    --timeout 600 \
+    --access-logfile /var/log/csvagent/access.log \
+    --error-logfile /var/log/csvagent/error.log
+
+Restart=always
+RestartSec=10
+
+# Логирование
+StandardOutput=append:/var/log/csvagent/access.log
+StandardError=append:/var/log/csvagent/error.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+# Основные зависимости агента
+openai>=1.0.0
+pandas>=2.0.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+python-dotenv>=1.0.0
+
+# API зависимости
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+pydantic>=2.0.0
+
+# Опционально для production
+gunicorn>=21.2.0
