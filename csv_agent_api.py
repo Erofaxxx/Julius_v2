@@ -23,6 +23,23 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from openai import OpenAI
 
+# Проверка поддержки Excel форматов
+try:
+    import openpyxl
+    EXCEL_SUPPORT = True
+    print("✓ Поддержка Excel (.xlsx, .xlsm): Включена")
+except ImportError:
+    EXCEL_SUPPORT = False
+    print("⚠️ openpyxl не установлен. Поддержка Excel отключена. Установите: pip install openpyxl")
+
+try:
+    import xlrd
+    XLS_SUPPORT = True
+    print("✓ Поддержка старых .xls файлов: Включена")
+except ImportError:
+    XLS_SUPPORT = False
+    print("⚠️ xlrd не установлен. Поддержка .xls файлов отключена. Установите: pip install xlrd")
+
 
 # Единственная модель - Claude Sonnet 4.5
 MODEL_ID = "anthropic/claude-sonnet-4.5"
@@ -178,6 +195,18 @@ class CSVAnalysisAgentAPI:
                 # Excel файл
                 load_info["file_format"] = "excel"
                 load_info["steps"].append(f"📊 Определён формат: Excel ({file_ext})")
+                
+                # Проверяем наличие необходимых библиотек
+                if file_ext == '.xls' and not XLS_SUPPORT:
+                    raise Exception(
+                        f"Формат .xls не поддерживается. "
+                        f"Установите библиотеку: pip install xlrd"
+                    )
+                if file_ext in ['.xlsx', '.xlsm'] and not EXCEL_SUPPORT:
+                    raise Exception(
+                        f"Формат Excel не поддерживается. "
+                        f"Установите библиотеку: pip install openpyxl"
+                    )
                 
                 try:
                     # Читаем первый лист Excel файла
