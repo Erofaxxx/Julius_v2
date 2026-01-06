@@ -145,10 +145,14 @@ class CSVAnalysisAgentAPI:
         
         return 'utf-8'
 
-    def smart_load_csv(self, file_bytes: bytes, filename: str = "data.csv") -> Dict[str, Any]:
+    def smart_load_file(self, file_bytes: bytes, filename: str = "data.csv") -> Dict[str, Any]:
         """
-        Умная загрузка CSV с автоматическим анализом структуры
+        Умная загрузка CSV/Excel с автоматическим анализом структуры
         Работает как Julius.ai - сначала понимает структуру, потом очищает
+        
+        Поддерживаемые форматы:
+        - CSV (.csv) - с автоопределением разделителя и кодировки
+        - Excel (.xlsx, .xls, .xlsm) - читает первый лист
 
         Returns:
             Dict с информацией о загрузке и очистке
@@ -159,20 +163,40 @@ class CSVAnalysisAgentAPI:
             "warnings": [],
             "original_shape": None,
             "final_shape": None,
-            "success": True
+            "success": True,
+            "file_format": "csv"
         }
 
         self.current_filename = filename
+        
+        # Определяем тип файла по расширению
+        file_ext = os.path.splitext(filename)[1].lower()
 
         try:
-            # Определяем разделитель и кодировку
-            sep = self._detect_separator(file_bytes)
-            encoding = self._detect_encoding(file_bytes)
-            
-            load_info["steps"].append(f"🔍 Определён разделитель: '{sep}', кодировка: {encoding}")
+            # Загрузка в зависимости от формата
+            if file_ext in ['.xlsx', '.xls', '.xlsm']:
+                # Excel файл
+                load_info["file_format"] = "excel"
+                load_info["steps"].append(f"📊 Определён формат: Excel ({file_ext})")
+                
+                try:
+                    # Читаем первый лист Excel файла
+                    df_raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0)
+                    load_info["steps"].append("📥 Загружен первый лист Excel файла")
+                except Exception as e:
+                    raise Exception(f"Ошибка чтения Excel файла: {str(e)}. Убедитесь что файл не повреждён.")
+            else:
+                # CSV файл
+                load_info["file_format"] = "csv"
+                # Определяем разделитель и кодировку
+                sep = self._detect_separator(file_bytes)
+                encoding = self._detect_encoding(file_bytes)
+                
+                load_info["steps"].append(f"🔍 Определён разделитель: '{sep}', кодировка: {encoding}")
 
-            # ШАГ 1: Загружаем "как есть"
-            df_raw = pd.read_csv(io.BytesIO(file_bytes), sep=sep, encoding=encoding, on_bad_lines='skip')
+                # Загружаем CSV "как есть"
+                df_raw = pd.read_csv(io.BytesIO(file_bytes), sep=sep, encoding=encoding, on_bad_lines='skip')
+            
             self.original_df = df_raw.copy()
             load_info["original_shape"] = df_raw.shape
             load_info["steps"].append(f"📥 Загружено: {df_raw.shape[0]} строк × {df_raw.shape[1]} колонок")
@@ -257,17 +281,22 @@ class CSVAnalysisAgentAPI:
 
     def load_csv_from_bytes(self, file_bytes: bytes, filename: str = "data.csv") -> pd.DataFrame:
         """
-        Загрузить CSV из байтов (с умной очисткой)
+        Загрузить CSV/Excel из байтов (с умной очисткой)
 
         Args:
-            file_bytes: Байты CSV файла
-            filename: Имя файла
+            file_bytes: Байты CSV или Excel файла
+            filename: Имя файла (важно для определения формата)
 
         Returns:
             DataFrame с данными
         """
-        self.smart_load_csv(file_bytes, filename)
+        self.smart_load_file(file_bytes, filename)
         return self.current_df
+    
+    # Алиас для обратной совместимости
+    def smart_load_csv(self, file_bytes: bytes, filename: str = "data.csv") -> Dict[str, Any]:
+        """Алиас для smart_load_file (обратная совместимость)"""
+        return self.smart_load_file(file_bytes, filename)
 
     def load_csv_from_file(self, file_path: str) -> pd.DataFrame:
         """
@@ -317,12 +346,15 @@ class CSVAnalysisAgentAPI:
     def df_to_csv_base64(self, df: pd.DataFrame = None) -> str:
         """
         Конвертировать DataFrame в base64 CSV
+        
+        Используется разделитель ';' для совместимости с Windows Excel
+        (в европейских/русских локалях Excel по умолчанию ожидает ';')
 
         Args:
             df: DataFrame для конвертации (по умолчанию current_df)
 
         Returns:
-            Base64 строка CSV файла
+            Base64 строка CSV файла с разделителем ';'
         """
         if df is None:
             df = self.current_df
@@ -331,7 +363,8 @@ class CSVAnalysisAgentAPI:
             return None
         
         csv_buffer = io.StringIO()
-        df.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
+        # sep=';' для Windows Excel, encoding='utf-8-sig' добавляет BOM для корректного отображения
+        df.to_csv(csv_buffer, index=False, encoding='utf-8-sig', sep=';')
         csv_bytes = csv_buffer.getvalue().encode('utf-8-sig')
         return base64.b64encode(csv_bytes).decode('utf-8')
 

@@ -5,6 +5,7 @@ FastAPI сервер для CSV Analysis Agent
 """
 
 import os
+import os.path
 import io
 import traceback
 from typing import Optional
@@ -127,11 +128,13 @@ async def analyze_csv(
     """
     agent = None
     try:
-        # Проверка формата файла
-        if not file.filename.endswith('.csv'):
+        # Проверка формата файла (CSV и Excel)
+        allowed_extensions = ['.csv', '.xlsx', '.xls', '.xlsm']
+        file_ext = os.path.splitext(file.filename)[1].lower()
+        if file_ext not in allowed_extensions:
             raise HTTPException(
                 status_code=400,
-                detail="Неподдерживаемый формат файла. Требуется CSV файл."
+                detail=f"Неподдерживаемый формат файла. Поддерживаются: {', '.join(allowed_extensions)}"
             )
 
         # Чтение CSV файла
