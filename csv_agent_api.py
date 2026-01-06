@@ -372,6 +372,142 @@ class CSVAnalysisAgentAPI:
 
         return schema
 
+    def get_deep_data_profile(self, df: pd.DataFrame) -> str:
+        """
+        Создаёт глубокий профиль данных для ИИ-агента.
+        Агент видит полную картину данных перед принятием решений.
+        
+        Returns:
+            Строка с детальным описанием данных
+        """
+        profile_lines = []
+        profile_lines.append("=" * 60)
+        profile_lines.append("📊 ГЛУБОКИЙ ПРОФИЛЬ ДАННЫХ")
+        profile_lines.append("=" * 60)
+        
+        # Базовая информация
+        total_cells = df.shape[0] * df.shape[1]
+        total_missing = df.isna().sum().sum()
+        fill_rate = ((total_cells - total_missing) / total_cells * 100) if total_cells > 0 else 0
+        
+        profile_lines.append(f"\n📐 РАЗМЕР: {df.shape[0]} строк × {df.shape[1]} колонок")
+        profile_lines.append(f"📈 ЗАПОЛНЕННОСТЬ: {fill_rate:.1f}% ({total_cells - total_missing}/{total_cells} ячеек)")
+        profile_lines.append(f"⚠️ ВСЕГО ПУСТЫХ ЯЧЕЕК: {total_missing}")
+        
+        # Детальный анализ каждой колонки
+        profile_lines.append(f"\n{'─' * 60}")
+        profile_lines.append("📋 ДЕТАЛЬНЫЙ АНАЛИЗ КОЛОНОК:")
+        profile_lines.append(f"{'─' * 60}")
+        
+        for col in df.columns:
+            col_data = df[col]
+            missing_count = col_data.isna().sum()
+            missing_pct = (missing_count / len(df) * 100) if len(df) > 0 else 0
+            non_null_count = col_data.notna().sum()
+            unique_count = col_data.nunique()
+            
+            # Определяем тип данных более точно
+            dtype = str(col_data.dtype)
+            if dtype == 'object':
+                # Проверяем на даты
+                sample_vals = col_data.dropna().head(10)
+                is_date = False
+                if len(sample_vals) > 0:
+                    try:
+                        pd.to_datetime(sample_vals, errors='raise')
+                        is_date = True
+                        dtype = "datetime (текст)"
+                    except:
+                        pass
+                if not is_date:
+                    dtype = "text"
+            elif 'int' in dtype or 'float' in dtype:
+                dtype = "numeric"
+            elif 'datetime' in dtype:
+                dtype = "datetime"
+            
+            # Формируем информацию о колонке
+            profile_lines.append(f"\n▸ '{col}' [{dtype}]")
+            
+            if missing_count > 0:
+                warning = "⚠️" if missing_pct > 10 else "ℹ️"
+                profile_lines.append(f"  {warning} Пустых: {missing_count} ({missing_pct:.1f}%)")
+            else:
+                profile_lines.append(f"  ✅ Пустых: 0 (полностью заполнена)")
+            
+            profile_lines.append(f"  📊 Уникальных значений: {unique_count}")
+            
+            # Примеры значений
+            sample_vals = col_data.dropna().head(5).tolist()
+            if sample_vals:
+                sample_str = ", ".join([str(v)[:30] for v in sample_vals])
+                profile_lines.append(f"  📝 Примеры: {sample_str}")
+            
+            # Для числовых - статистика
+            if 'numeric' in dtype and non_null_count > 0:
+                try:
+                    profile_lines.append(f"  📈 Мин: {col_data.min():.2f}, Макс: {col_data.max():.2f}, Среднее: {col_data.mean():.2f}")
+                except:
+                    pass
+        
+        # Поиск потенциальных проблем
+        profile_lines.append(f"\n{'─' * 60}")
+        profile_lines.append("🔍 ОБНАРУЖЕННЫЕ ОСОБЕННОСТИ ДАННЫХ:")
+        profile_lines.append(f"{'─' * 60}")
+        
+        problems_found = False
+        
+        # Колонки с большим количеством пустых значений
+        for col in df.columns:
+            missing_pct = (df[col].isna().sum() / len(df) * 100) if len(df) > 0 else 0
+            if missing_pct > 0:
+                problems_found = True
+                if missing_pct > 50:
+                    profile_lines.append(f"⚠️ '{col}' - {missing_pct:.1f}% пустых (большая часть данных отсутствует)")
+                elif missing_pct > 10:
+                    profile_lines.append(f"ℹ️ '{col}' - {missing_pct:.1f}% пустых")
+                else:
+                    profile_lines.append(f"📌 '{col}' - {df[col].isna().sum()} пустых значений ({missing_pct:.1f}%)")
+        
+        # Проверка на дубликаты
+        dup_count = df.duplicated().sum()
+        if dup_count > 0:
+            problems_found = True
+            profile_lines.append(f"⚠️ Найдено {dup_count} дубликатов строк")
+        
+        if not problems_found:
+            profile_lines.append("✅ Данные выглядят чистыми, явных проблем не обнаружено")
+        
+        # Примеры строк с пустыми значениями
+        rows_with_na = df[df.isna().any(axis=1)]
+        if len(rows_with_na) > 0:
+            profile_lines.append(f"\n{'─' * 60}")
+            profile_lines.append(f"📋 ПРИМЕРЫ СТРОК С ПУСТЫМИ ЗНАЧЕНИЯМИ ({min(3, len(rows_with_na))} из {len(rows_with_na)}):")
+            profile_lines.append(f"{'─' * 60}")
+            for idx, row in rows_with_na.head(3).iterrows():
+                na_cols = [col for col in df.columns if pd.isna(row[col])]
+                profile_lines.append(f"  Строка {idx}: пустые в колонках [{', '.join(na_cols)}]")
+                # Показываем несколько значений из этой строки
+                non_na_vals = [(col, row[col]) for col in df.columns[:4] if pd.notna(row[col])]
+                if non_na_vals:
+                    vals_str = ", ".join([f"{col}={val}" for col, val in non_na_vals])
+                    profile_lines.append(f"    Данные: {vals_str}...")
+        
+        # Примеры полных строк (без пустых)
+        complete_rows = df.dropna()
+        if len(complete_rows) > 0:
+            profile_lines.append(f"\n{'─' * 60}")
+            profile_lines.append(f"✅ ПРИМЕРЫ ПОЛНЫХ СТРОК (без пустых):")
+            profile_lines.append(f"{'─' * 60}")
+            for idx, row in complete_rows.head(2).iterrows():
+                vals = [(col, row[col]) for col in df.columns[:5]]
+                vals_str = ", ".join([f"{col}={val}" for col, val in vals])
+                profile_lines.append(f"  Строка {idx}: {vals_str}...")
+        
+        profile_lines.append(f"\n{'=' * 60}")
+        
+        return "\n".join(profile_lines)
+
     def df_to_csv_base64(self, df: pd.DataFrame = None) -> str:
         """
         Конвертировать DataFrame в base64 CSV
@@ -698,129 +834,140 @@ class CSVAnalysisAgentAPI:
         Returns:
             Сгенерированный Python код
         """
-        system_prompt = """Ты эксперт-аналитик данных и редактор таблиц, работающий как Julius.ai.
+        system_prompt = """Ты эксперт-аналитик данных, работающий как Julius.ai.
 
-🎯 ТВОЯ ЗАДАЧА: Писать код который работает ПОЭТАПНО, ЛОГИРУЕТ каждый шаг и может РЕДАКТИРОВАТЬ данные.
+🧠 ГЛАВНОЕ ПРАВИЛО: СНАЧАЛА ДУМАЙ, ПОТОМ ДЕЙСТВУЙ!
 
+Перед выполнением ЛЮБОГО запроса ты ОБЯЗАН:
+1. ИЗУЧИТЬ данные (смотри профиль данных внимательно)
+2. ПОНЯТЬ что именно хочет пользователь
+3. ПРОВЕРИТЬ есть ли нужные данные/колонки
+4. ВЫПОЛНИТЬ задачу с учётом реального состояния данных
+
+═══════════════════════════════════════════════════════════
 📋 ОБЯЗАТЕЛЬНАЯ СТРУКТУРА КОДА:
+═══════════════════════════════════════════════════════════
 
 ```python
-# === ШАГ 1: ПОНИМАНИЕ ДАННЫХ ===
-print("🔍 ШАГ 1: Изучаю структуру данных...")
-print(f"Размер данных: {len(df)} строк, {len(df.columns)} колонок")
-print(f"Колонки: {list(df.columns)}")
+# === ШАГ 1: ИЗУЧЕНИЕ ДАННЫХ ===
+print("🔍 ШАГ 1: Изучаю данные...")
+print(f"Размер: {len(df)} строк, {len(df.columns)} колонок")
 
-# === ШАГ 2: ПРОВЕРКА И ОЧИСТКА ===
-print("\\n🧹 ШАГ 2: Проверяю качество данных...")
+# ВСЕГДА проверяй пустые значения ПЕРЕД любой операцией!
+missing_info = df.isna().sum()
+cols_with_missing = missing_info[missing_info > 0]
+if len(cols_with_missing) > 0:
+    print(f"⚠️ Найдены пустые значения:")
+    for col, count in cols_with_missing.items():
+        print(f"   • {col}: {count} пустых ({count/len(df)*100:.1f}%)")
+else:
+    print("✅ Пустых значений нет")
 
-# Ищем нужные колонки (гибкий поиск)
-def find_column(df, keywords):
-    for col in df.columns:
-        col_lower = str(col).lower()
-        if any(keyword.lower() in col_lower for keyword in keywords):
-            return col
-    return None
+# Строки с любыми пустыми значениями
+rows_with_na = df[df.isna().any(axis=1)]
+print(f"📊 Строк с пустыми значениями: {len(rows_with_na)} из {len(df)}")
 
-# === ШАГ 3: РЕДАКТИРОВАНИЕ ДАННЫХ (если нужно) ===
-# Если пользователь просит изменить данные:
+# === ШАГ 2: ПОНИМАНИЕ ЗАПРОСА ===
+print("\\n🎯 ШАГ 2: Анализирую запрос пользователя...")
+# Объясни что понял из запроса
 
-# Удаление строк по условию:
-# df = df[df['column'] != 'value']  # Удалить строки где column = value
-# df = df.drop(index=[0, 1, 2])  # Удалить строки по индексам
+# === ШАГ 3: ВЫПОЛНЕНИЕ ===
+print("\\n⚙️ ШАГ 3: Выполняю...")
 
-# Удаление колонок:
-# df = df.drop(columns=['column_name'])
+# Для РЕДАКТИРОВАНИЯ данных:
+# df = df.dropna()  # Удалить ВСЕ строки с любыми пустыми значениями
+# df = df.dropna(subset=['col1', 'col2'])  # Удалить строки с пустыми в конкретных колонках
+# df = df.drop(columns=['col'])  # Удалить колонку
+# df['new'] = ...  # Добавить колонку
+# df = df[df['col'] > 100]  # Фильтрация
 
-# Добавление колонки:
-# df['new_column'] = df['col1'] + df['col2']
+# ВАЖНО! После изменения данных:
+# modified_df = df.copy()
 
-# Добавление строки:
-# new_row = {'col1': val1, 'col2': val2}
-# df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-
-# Замена значений:
-# df['column'] = df['column'].replace('old', 'new')
-
-# Переименование колонок:
-# df = df.rename(columns={'old_name': 'new_name'})
-
-# Сортировка:
-# df = df.sort_values(by='column', ascending=True)
-
-# ВАЖНО! Если данные были изменены, сохраняем их:
-# modified_df = df.copy()  # Это вернёт изменённую таблицу пользователю
-
-# === ШАГ 4: АНАЛИЗ / ВИЗУАЛИЗАЦИЯ ===
-print("\\n📊 ШАГ 4: Выполняю анализ...")
-
-# === ШАГ 5: ФОРМАТИРОВАННЫЙ РЕЗУЛЬТАТ ===
-print("\\n✅ ШАГ 5: Формирую финальный отчет...")
-
-# Создаем MARKDOWN таблицу для результата
-# НЕ используй print(result) - просто присвой строку в result
+# === ШАГ 4: РЕЗУЛЬТАТ ===
+print("\\n✅ ШАГ 4: Готово!")
 
 result = f\"\"\"
-## 📊 Результаты
+## 📊 Результат
 
 Описание что было сделано...
 
-| Колонка | Значение |
-|---------|----------|
-| Данные  | {value}  |
-
-✅ Готово!
+| Показатель | Значение |
+|------------|----------|
+| До | {before} |
+| После | {after} |
 \"\"\"
 
-# Если данные были изменены, ОБЯЗАТЕЛЬНО установи modified_df:
+# Если данные изменены - ОБЯЗАТЕЛЬНО:
 # modified_df = df.copy()
 ```
 
-🔧 РЕДАКТИРОВАНИЕ ДАННЫХ:
+═══════════════════════════════════════════════════════════
+🔧 ТИПИЧНЫЕ ОПЕРАЦИИ С ДАННЫМИ:
+═══════════════════════════════════════════════════════════
 
-Когда пользователь просит:
-- "удали строки где..." → df = df[~condition] или df.drop()
-- "удали колонку..." → df = df.drop(columns=[...])
-- "добавь колонку..." → df['new'] = ...
-- "добавь строку..." → pd.concat()
-- "замени..." → df.replace() или df.loc[]
-- "переименуй..." → df.rename()
-- "отсортируй..." → df.sort_values()
-- "оставь только..." → df = df[condition]
-- "приведи в порядок..." → комплексная очистка
-
-**ОБЯЗАТЕЛЬНО** после любого изменения данных установи:
+📌 УДАЛЕНИЕ СТРОК С ПУСТЫМИ ЗНАЧЕНИЯМИ:
 ```python
+# Показать текущее состояние
+rows_before = len(df)
+rows_with_na = df[df.isna().any(axis=1)]
+print(f"Строк с пустыми: {len(rows_with_na)}")
+
+# Удалить ВСЕ строки где есть хотя бы одно пустое значение
+df = df.dropna()
+
+# ИЛИ удалить только где пустые в конкретных колонках
+# df = df.dropna(subset=['Column1', 'Column2'])
+
+rows_after = len(df)
+print(f"Удалено строк: {rows_before - rows_after}")
 modified_df = df.copy()
 ```
-Это вернёт изменённую таблицу пользователю!
 
-🎯 КЛЮЧЕВЫЕ ПРАВИЛА:
+📌 УДАЛЕНИЕ КОЛОНОК:
+```python
+df = df.drop(columns=['Column_Name'])
+modified_df = df.copy()
+```
 
-1. **ЛОГИРУЙ КАЖДЫЙ ШАГ** через print()
+📌 ФИЛЬТРАЦИЯ:
+```python
+df = df[df['Column'] > 100]
+df = df[df['Column'].notna()]  # Только непустые
+modified_df = df.copy()
+```
 
-2. **ИЩИ КОЛОНКИ ГИБКО** - по ключевым словам
+📌 ЗАПОЛНЕНИЕ ПУСТЫХ:
+```python
+df['Column'] = df['Column'].fillna(0)  # Заполнить нулями
+df['Column'] = df['Column'].fillna(df['Column'].mean())  # Средним
+modified_df = df.copy()
+```
 
-3. **ФОРМАТИРУЙ ЧИСЛА**:
-   - В таблицах: `{value:,.0f}` или `{value:,.2f}`
-   - На графиках: `plt.FuncFormatter(lambda x, p: f'{x:,.0f}')`
+═══════════════════════════════════════════════════════════
+⚠️ КРИТИЧЕСКИ ВАЖНЫЕ ПРАВИЛА:
+═══════════════════════════════════════════════════════════
 
-4. **СОЗДАВАЙ MARKDOWN ТАБЛИЦЫ** (НЕ код-блоки!):
-   - Формат: `| Колонка | Значение |`
-   - Разделитель: `|---------|----------|`
+1. **ВСЕГДА ПРОВЕРЯЙ df.isna().sum()** перед ответом о пустых данных!
 
-5. **result = MARKDOWN строка**:
-   - Заголовки ##, ###
-   - Таблицы в Markdown формате
-   - Эмодзи для наглядности
-   - **НЕ печатай result!**
-   - **НЕ используй ``` вокруг таблиц!**
+2. **ИСПОЛЬЗУЙ ДАННЫЕ ИЗ ПРОФИЛЯ** - там уже есть вся информация о пустых значениях
 
-6. **modified_df = df.copy()** - если изменил данные!
+3. **НЕ ОТВЕЧАЙ "пустых нет"** пока не проверил! Смотри профиль данных!
 
-7. **ОБРАБОТКА ОШИБОК** - если что-то не найдено, объясни и покажи доступные колонки
+4. **modified_df = df.copy()** - ОБЯЗАТЕЛЬНО после любого изменения!
+
+5. **ЛОГИРУЙ ВСЁ** через print() - пользователь должен видеть каждый шаг
+
+6. **ФОРМАТИРУЙ ЧИСЛА**: {value:,.0f} или {value:,.2f}
+
+7. **result = строка с Markdown** - заголовки ##, таблицы, эмодзи
+
+8. **ГИБКИЙ ПОИСК КОЛОНОК** - ищи по ключевым словам, не точное совпадение
 """
 
-        # Формируем детальное описание данных
+        # Формируем детальное описание данных с глубоким профилем
+        deep_profile = self.get_deep_data_profile(self.current_df)
+        
         column_details = []
         for col in schema['columns']:
             dtype = schema['dtypes'][col]
@@ -842,24 +989,16 @@ modified_df = df.copy()
             column_details.append(col_info)
 
         user_message = f"""
-📊 ДАННЫЕ CSV ФАЙЛА:
+{deep_profile}
 
-РАЗМЕР: {schema['shape']['rows']} строк × {schema['shape']['columns']} колонок
-
-КОЛОНКИ:
-{chr(10).join(column_details)}
-
-ПРИМЕРЫ ПЕРВЫХ СТРОК:
-{json.dumps(schema['sample_data'][:3], indent=2, ensure_ascii=False)}
-
+═══════════════════════════════════════════════════════════
 🎯 ЗАПРОС ПОЛЬЗОВАТЕЛЯ: {user_query}
+═══════════════════════════════════════════════════════════
 
-⚡ ВАЖНО:
-- Логируй каждый шаг через print()
-- Ищи колонки гибко (по ключевым словам)
-- Проверяй существование колонок
-- Форматируй ВСЕ числа
-- Создавай красивые таблицы
+⚡ НАПОМИНАНИЕ:
+- Внимательно изучи ПРОФИЛЬ ДАННЫХ выше!
+- Там указаны ВСЕ пустые значения по каждой колонке!
+- СНАЧАЛА проверь данные, ПОТОМ действуй!
 - Если редактируешь данные - установи modified_df = df.copy()
 """
 
