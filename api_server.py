@@ -8,12 +8,16 @@ import os
 import os.path
 import io
 import traceback
+import uuid
+import requests
+import asyncio
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
 import uvicorn
 from dotenv import load_dotenv
@@ -27,8 +31,58 @@ load_dotenv()
 app = FastAPI(
     title="CSV Analysis Agent API",
     description="AI-powered CSV analysis and editing with Claude Sonnet 4.5",
-    version="2.0.0"
+    version="2.1.0"
 )
+
+# Директория для временных файлов
+TEMP_FILES_DIR = Path("./temp_files")
+TEMP_FILES_DIR.mkdir(exist_ok=True)
+
+# Размер файла для переключения на URL (10 МБ)
+LARGE_FILE_THRESHOLD = 10 * 1024 * 1024  # 10 MB
+
+# Время жизни временных файлов (1 час)
+FILE_EXPIRY_TIME = timedelta(hours=1)
+
+
+def cleanup_old_files():
+    """Удаляет файлы старше 1 часа"""
+    try:
+        now = datetime.now()
+        for file_path in TEMP_FILES_DIR.glob("*"):
+            if file_path.is_file():
+                file_age = now - datetime.fromtimestamp(file_path.stat().st_mtime)
+                if file_age > FILE_EXPIRY_TIME:
+                    file_path.unlink()
+                    print(f"🗑️ Удалён старый файл: {file_path.name}")
+    except Exception as e:
+        print(f"⚠️ Ошибка очистки файлов: {e}")
+
+
+async def cleanup_file_after_delay(file_path: Path, delay: timedelta):
+    """Удаляет файл после заданной задержки"""
+    await asyncio.sleep(delay.total_seconds())
+    try:
+        if file_path.exists():
+            file_path.unlink()
+            print(f"🗑️ Удалён файл по истечении срока: {file_path.name}")
+    except Exception as e:
+        print(f"⚠️ Ошибка удаления файла {file_path.name}: {e}")
+
+
+async def periodic_cleanup():
+    """Периодическая очистка старых файлов каждые 30 минут"""
+    while True:
+        await asyncio.sleep(1800)  # 30 минут
+        cleanup_old_files()
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Запуск фоновой задачи очистки при старте сервера"""
+    asyncio.create_task(periodic_cleanup())
+    print(f"✓ Директория для временных файлов: {TEMP_FILES_DIR.absolute()}")
+    print(f"✓ Порог для больших файлов: {LARGE_FILE_THRESHOLD / (1024*1024):.0f} МБ")
 
 # CORS для работы с Lovable и другими frontend
 app.add_middleware(
@@ -65,7 +119,7 @@ async def root():
     return {
         "status": "online",
         "service": "CSV Analysis Agent API",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "model": MODEL_NAME,
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -92,14 +146,15 @@ async def get_api_info():
     return {
         "success": True,
         "service": "CSV Analysis Agent API",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "model": MODEL_NAME,
         "features": [
             "Анализ CSV данных",
+            "Поддержка больших файлов через signed URL",
             "Редактирование данных (добавление/удаление строк и колонок)",
             "Автоматическая очистка данных",
             "Построение графиков и визуализаций",
-            "Возврат изменённого CSV файла"
+            "Возврат изменённого CSV файла (base64 или URL)"
         ],
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -107,15 +162,26 @@ async def get_api_info():
 
 @app.post("/api/analyze")
 async def analyze_csv(
-    file: UploadFile = File(..., description="CSV файл для анализа"),
+    background_tasks: BackgroundTasks,
+    file: Optional[UploadFile] = File(None, description="CSV/Excel файл для анализа"),
+    file_url: Optional[str] = Form(None, description="Signed URL для загрузки большого файла"),
+    file_name: Optional[str] = Form(None, description="Имя файла (используется с file_url)"),
+    file_type: Optional[str] = Form(None, description="MIME тип файла (используется с file_url)"),
     query: Optional[str] = Form("", description="Запрос пользователя (пустой = автоочистка)"),
     chat_history: Optional[str] = Form(None, description="История чата в JSON формате")
 ):
     """
     Основной endpoint для анализа и редактирования CSV файла
+    
+    Поддерживает два режима:
+    1. Прямая загрузка файла (file) - для файлов <10 МБ
+    2. Загрузка по signed URL (file_url + file_name) - для больших файлов >10 МБ
 
     Args:
-        file: Загруженный CSV файл
+        file: Загруженный CSV/Excel файл (опционально)
+        file_url: Signed URL для скачивания файла из Supabase Storage (опционально)
+        file_name: Имя файла (обязательно при использовании file_url)
+        file_type: MIME тип файла (опционально)
         query: Запрос пользователя. Если пустой - выполняется автоматическая очистка данных
         chat_history: JSON строка с историей предыдущих запросов (опционально)
 
@@ -123,22 +189,57 @@ async def analyze_csv(
         JSON с результатами анализа, включая:
         - text_output: текстовый результат анализа
         - plots: графики в base64
-        - modified_csv: изменённый CSV в base64 (если данные были изменены)
+        - modified_csv: изменённый CSV в base64 (для маленьких файлов)
+        - modified_file_url: URL для скачивания (для больших файлов)
+        - modified_file_name: имя модифицированного файла
         - was_modified: флаг изменения данных
     """
     agent = None
     try:
+        # Определяем источник файла
+        if file_url:
+            # Режим 1: Скачивание по signed URL (для больших файлов)
+            if not file_name:
+                raise HTTPException(
+                    status_code=400,
+                    detail="file_name обязателен при использовании file_url"
+                )
+            
+            print(f"📥 Скачивание большого файла по URL: {file_name}")
+            
+            try:
+                # Скачиваем файл с таймаутом
+                response = requests.get(file_url, timeout=120, stream=True)
+                response.raise_for_status()
+                file_bytes = response.content
+                filename = file_name
+                
+                print(f"✓ Файл скачан: {len(file_bytes) / (1024*1024):.2f} МБ")
+                
+            except requests.exceptions.RequestException as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Не удалось скачать файл по URL: {str(e)}"
+                )
+        elif file:
+            # Режим 2: Прямая загрузка файла (для маленьких файлов)
+            file_bytes = await file.read()
+            filename = file.filename
+            print(f"📤 Получен загруженный файл: {filename} ({len(file_bytes) / (1024*1024):.2f} МБ)")
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Необходимо указать либо file, либо file_url + file_name"
+            )
+        
         # Проверка формата файла (CSV и Excel)
         allowed_extensions = ['.csv', '.xlsx', '.xls', '.xlsm']
-        file_ext = os.path.splitext(file.filename)[1].lower()
+        file_ext = os.path.splitext(filename)[1].lower()
         if file_ext not in allowed_extensions:
             raise HTTPException(
                 status_code=400,
                 detail=f"Неподдерживаемый формат файла. Поддерживаются: {', '.join(allowed_extensions)}"
             )
-
-        # Чтение CSV файла
-        file_bytes = await file.read()
 
         # Парсинг истории если есть
         history = None
@@ -157,11 +258,11 @@ async def analyze_csv(
 
         # Загрузка CSV
         try:
-            df = agent.load_csv_from_bytes(file_bytes, file.filename)
+            df = agent.load_csv_from_bytes(file_bytes, filename)
         except Exception as e:
             raise HTTPException(
                 status_code=400,
-                detail=f"Ошибка при чтении CSV файла: {str(e)}"
+                detail=f"Ошибка при чтении файла: {str(e)}"
             )
 
         # Выполнение анализа (или автоочистки если query пустой)
@@ -169,7 +270,7 @@ async def analyze_csv(
 
         # Добавляем информацию о файле
         result["file_info"] = {
-            "filename": file.filename,
+            "filename": filename,
             "size_bytes": len(file_bytes),
             "rows": df.shape[0],
             "columns": df.shape[1]
@@ -177,6 +278,49 @@ async def analyze_csv(
         result["model_info"] = {
             "model_name": MODEL_NAME
         }
+        
+        # Если данные были изменены и файл большой - сохраняем на диск
+        if result.get("was_modified") and result.get("modified_csv"):
+            modified_csv_b64 = result["modified_csv"]
+            
+            # Оценка размера результата
+            import base64
+            estimated_size = len(base64.b64decode(modified_csv_b64))
+            
+            if estimated_size > LARGE_FILE_THRESHOLD:
+                # Большой файл - сохраняем на диск и возвращаем URL
+                print(f"💾 Файл большой ({estimated_size / (1024*1024):.2f} МБ), сохраняем на диск...")
+                
+                # Генерируем уникальное имя файла
+                unique_id = str(uuid.uuid4())
+                base_name = os.path.splitext(filename)[0]
+                result_filename = f"{base_name}_modified_{unique_id}.csv"
+                result_path = TEMP_FILES_DIR / result_filename
+                
+                # Сохраняем файл
+                csv_content = base64.b64decode(modified_csv_b64)
+                result_path.write_bytes(csv_content)
+                
+                # Планируем удаление через 1 час
+                background_tasks.add_task(lambda: cleanup_file_after_delay(result_path, FILE_EXPIRY_TIME))
+                
+                # Формируем URL для скачивания
+                # Предполагаем что сервер доступен по HTTPS
+                server_url = os.getenv("SERVER_URL", "https://server.asktab.ru")
+                download_url = f"{server_url}/api/download/{result_filename}"
+                
+                # Заменяем base64 на URL
+                result["modified_csv"] = None  # Убираем base64 для экономии трафика
+                result["modified_file_url"] = download_url
+                result["modified_file_name"] = result_filename
+                result["file_delivery_mode"] = "url"  # Режим доставки
+                
+                print(f"✓ Файл сохранён: {result_filename}")
+                print(f"✓ URL: {download_url}")
+            else:
+                # Маленький файл - оставляем base64
+                result["file_delivery_mode"] = "base64"
+                print(f"✓ Файл маленький ({estimated_size / 1024:.2f} КБ), возвращаем в base64")
 
         return JSONResponse(content=result)
 
@@ -202,19 +346,31 @@ async def analyze_csv(
 
 @app.post("/api/auto-clean")
 async def auto_clean_csv(
-    file: UploadFile = File(..., description="CSV файл для автоматической очистки")
+    background_tasks: BackgroundTasks,
+    file: Optional[UploadFile] = File(None, description="CSV файл для автоматической очистки"),
+    file_url: Optional[str] = Form(None, description="Signed URL файла"),
+    file_name: Optional[str] = Form(None, description="Имя файла")
 ):
     """
     Endpoint для автоматической очистки CSV файла
     Эквивалентен вызову /api/analyze с пустым query
 
     Args:
-        file: Загруженный CSV файл
+        file: Загруженный CSV файл (опционально)
+        file_url: Signed URL для больших файлов (опционально)
+        file_name: Имя файла (при использовании file_url)
 
     Returns:
         JSON с результатами очистки и изменённым CSV
     """
-    return await analyze_csv(file=file, query="", chat_history=None)
+    return await analyze_csv(
+        background_tasks=background_tasks,
+        file=file,
+        file_url=file_url,
+        file_name=file_name,
+        query="",
+        chat_history=None
+    )
 
 
 @app.post("/api/schema")
@@ -279,8 +435,61 @@ async def get_csv_schema(
             del agent
 
 
+@app.get("/api/download/{filename}")
+async def download_file(filename: str):
+    """
+    Скачивание временного файла с результатами
+    
+    Args:
+        filename: Имя файла для скачивания
+    
+    Returns:
+        Файл для скачивания с CORS заголовками
+    """
+    try:
+        file_path = TEMP_FILES_DIR / filename
+        
+        # Проверка существования файла
+        if not file_path.exists():
+            raise HTTPException(
+                status_code=404,
+                detail="Файл не найден или срок действия ссылки истёк (>1 часа)"
+            )
+        
+        # Проверка что файл не слишком старый
+        file_age = datetime.now() - datetime.fromtimestamp(file_path.stat().st_mtime)
+        if file_age > FILE_EXPIRY_TIME:
+            file_path.unlink()  # Удаляем старый файл
+            raise HTTPException(
+                status_code=410,
+                detail="Срок действия ссылки истёк. Файл был удалён."
+            )
+        
+        # Возвращаем файл с правильными заголовками
+        return FileResponse(
+            path=file_path,
+            media_type="text/csv",
+            filename=filename,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Expose-Headers": "Content-Disposition",
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-cache, no-store, must-revalidate"
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Ошибка при скачивании файла: {str(e)}"
+        )
+
+
 @app.post("/api/quick-analyze")
 async def quick_analyze(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     query: str = Form(...)
 ):
@@ -294,7 +503,12 @@ async def quick_analyze(
     Returns:
         Результаты анализа
     """
-    return await analyze_csv(file=file, query=query, chat_history=None)
+    return await analyze_csv(
+        background_tasks=background_tasks,
+        file=file,
+        query=query,
+        chat_history=None
+    )
 
 
 # Запуск сервера
@@ -304,14 +518,16 @@ if __name__ == "__main__":
 
     print(f"""
 ╔════════════════════════════════════════════════════════════╗
-║         CSV Analysis Agent API Server v2.0                 ║
+║         CSV Analysis Agent API Server v2.1                 ║
 ║         Powered by {MODEL_NAME}                       ║
 ╚════════════════════════════════════════════════════════════╝
 
-Новые возможности:
+Новые возможности v2.1:
+✓ Поддержка больших файлов (50-200+ МБ) через signed URL
+✓ Автоматическое переключение base64 ↔ URL в зависимости от размера
 ✓ Редактирование данных (добавление/удаление строк и колонок)
 ✓ Автоматическая очистка данных при загрузке без запроса
-✓ Возврат изменённого CSV файла в base64
+✓ Умный AI-агент с глубоким анализом данных
 
 Server starting...
 - Host: {host}
