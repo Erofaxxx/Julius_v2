@@ -12,17 +12,28 @@ Environment="PATH=/home/csvagent/Claude_code/venv/bin"
 # Для простого запуска через uvicorn (для тестирования)
 # ExecStart=/home/csvagent/Claude_code/venv/bin/python api_server.py
 
-# Для production с Gunicorn (рекомендуется)
+# Для production с Gunicorn
+# ВАЖНО: Для сервера с 1 ГБ RAM используем только 2 workers
+# (4 workers потребляют слишком много памяти и вызывают OOM при больших файлах)
 ExecStart=/home/csvagent/Claude_code/venv/bin/gunicorn api_server:app \
-    --workers 4 \
+    --workers 2 \
     --worker-class uvicorn.workers.UvicornWorker \
     --bind 0.0.0.0:8000 \
     --timeout 600 \
+    --graceful-timeout 300 \
+    --keep-alive 5 \
+    --max-requests 100 \
+    --max-requests-jitter 20 \
     --access-logfile /var/log/csvagent/access.log \
     --error-logfile /var/log/csvagent/error.log
 
 Restart=always
 RestartSec=10
+
+# Ограничение памяти для защиты от OOM
+# Если процесс потребляет больше - systemd его перезапустит
+MemoryMax=900M
+MemoryHigh=700M
 
 # Логирование
 StandardOutput=append:/var/log/csvagent/access.log
