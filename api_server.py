@@ -287,6 +287,9 @@ async def analyze_csv(
                 status_code=400,
                 detail=f"Неподдерживаемый формат файла. Поддерживаются: {', '.join(allowed_extensions)}"
             )
+        
+        print(f"✓ Формат файла проверен: {file_ext}")
+        print(f"📊 Размер в памяти: {len(file_bytes) / (1024*1024):.2f} МБ")
 
         # Парсинг истории если есть
         history = None
@@ -294,6 +297,7 @@ async def analyze_csv(
             import json
             try:
                 history = json.loads(chat_history)
+                print(f"✓ История чата загружена: {len(history)} сообщений")
             except json.JSONDecodeError:
                 raise HTTPException(
                     status_code=400,
@@ -301,21 +305,42 @@ async def analyze_csv(
                 )
 
         # Создание агента
+        print(f"🤖 Создание AI агента...")
         agent = CSVAnalysisAgentAPI(api_key=OPENROUTER_API_KEY)
+        print(f"✓ Агент создан")
 
         # Загрузка CSV
+        print(f"📂 Начинаем загрузку данных в pandas...")
+        load_start = datetime.now()
         try:
             df = agent.load_csv_from_bytes(file_bytes, filename)
+            load_time = (datetime.now() - load_start).total_seconds()
+            print(f"✓ Данные загружены за {load_time:.2f} сек: {df.shape[0]} строк × {df.shape[1]} колонок")
+            print(f"💾 Память DataFrame: {df.memory_usage(deep=True).sum() / (1024*1024):.2f} МБ")
         except Exception as e:
+            print(f"❌ Ошибка загрузки данных: {e}")
+            print(f"📋 Traceback: {traceback.format_exc()}")
             raise HTTPException(
                 status_code=400,
                 detail=f"Ошибка при чтении файла: {str(e)}"
             )
 
         # Выполнение анализа (или автоочистки если query пустой)
-        result = agent.analyze(query, chat_history=history)
+        print(f"🧠 Начинаем AI анализ...")
+        print(f"📝 Запрос: '{query[:100] if query else '[автоочистка]'}{'...' if len(query) > 100 else ''}')")
+        analysis_start = datetime.now()
+        
+        try:
+            result = agent.analyze(query, chat_history=history)
+            analysis_time = (datetime.now() - analysis_start).total_seconds()
+            print(f"✓ Анализ завершён за {analysis_time:.2f} сек")
+        except Exception as e:
+            print(f"❌ Ошибка AI анализа: {e}")
+            print(f"📋 Traceback: {traceback.format_exc()}")
+            raise
 
         # Добавляем информацию о файле
+        print(f"📦 Формирование ответа...")
         result["file_info"] = {
             "filename": filename,
             "size_bytes": len(file_bytes),
@@ -328,11 +353,13 @@ async def analyze_csv(
         
         # Если данные были изменены и файл большой - сохраняем на диск
         if result.get("was_modified") and result.get("modified_csv"):
+            print(f"💾 Обработка изменённых данных...")
             modified_csv_b64 = result["modified_csv"]
             
             # Оценка размера результата
             import base64
             estimated_size = len(base64.b64decode(modified_csv_b64))
+            print(f"📏 Размер результата: {estimated_size / (1024*1024):.2f} МБ")
             
             if estimated_size > LARGE_FILE_THRESHOLD:
                 # Большой файл - сохраняем на диск и возвращаем URL
@@ -368,7 +395,9 @@ async def analyze_csv(
                 # Маленький файл - оставляем base64
                 result["file_delivery_mode"] = "base64"
                 print(f"✓ Файл маленький ({estimated_size / 1024:.2f} КБ), возвращаем в base64")
-
+        
+        print(f"✅ Запрос обработан успешно")
+        print(f"📤 Отправка ответа клиенту...")
         return JSONResponse(content=result)
 
     except HTTPException:
