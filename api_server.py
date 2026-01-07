@@ -9,7 +9,7 @@ import os.path
 import io
 import traceback
 import uuid
-import requests
+import httpx
 import asyncio
 from typing import Optional
 from datetime import datetime, timedelta
@@ -206,20 +206,67 @@ async def analyze_csv(
                 )
             
             print(f"📥 Скачивание большого файла по URL: {file_name}")
+            print(f"🔗 URL: {file_url[:100]}...")
             
             try:
-                # Скачиваем файл с таймаутом
-                response = requests.get(file_url, timeout=120, stream=True)
-                response.raise_for_status()
-                file_bytes = response.content
-                filename = file_name
+                # Проверка доступности URL перед скачиванием (HEAD запрос)
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    try:
+                        head_response = await client.head(file_url)
+                        content_length = head_response.headers.get('content-length')
+                        if content_length:
+                            file_size_mb = int(content_length) / (1024 * 1024)
+                            print(f"📊 Размер файла: {file_size_mb:.2f} МБ")
+                    except Exception as e:
+                        print(f"⚠️ Не удалось получить размер файла: {e}")
                 
-                print(f"✓ Файл скачан: {len(file_bytes) / (1024*1024):.2f} МБ")
+                # Скачиваем файл с увеличенным таймаутом (10 минут)
+                print(f"⏳ Начинаем загрузку... (таймаут: 600 сек)")
+                download_start = datetime.now()
                 
-            except requests.exceptions.RequestException as e:
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(600.0, connect=60.0),  # 10 мин общий, 1 мин на подключение
+                    limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
+                ) as client:
+                    response = await client.get(file_url)
+                    response.raise_for_status()
+                    file_bytes = response.content
+                    filename = file_name
+                
+                download_time = (datetime.now() - download_start).total_seconds()
+                file_size_mb = len(file_bytes) / (1024 * 1024)
+                speed_mbps = file_size_mb / download_time if download_time > 0 else 0
+                
+                print(f"✓ Файл скачан: {file_size_mb:.2f} МБ за {download_time:.1f} сек ({speed_mbps:.2f} МБ/сек)")
+                
+            except httpx.TimeoutException as e:
+                error_msg = f"Таймаут при скачивании файла (>600 сек). Файл: {file_name}"
+                print(f"❌ {error_msg}")
+                raise HTTPException(
+                    status_code=504,
+                    detail=error_msg
+                )
+            except httpx.HTTPStatusError as e:
+                error_msg = f"HTTP ошибка {e.response.status_code} при скачивании файла"
+                print(f"❌ {error_msg}")
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Не удалось скачать файл по URL: {str(e)}"
+                    detail=f"{error_msg}: {str(e)}"
+                )
+            except httpx.RequestError as e:
+                error_msg = f"Ошибка сети при скачивании файла"
+                print(f"❌ {error_msg}: {e}")
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"{error_msg}. Проверьте доступность Supabase Storage."
+                )
+            except Exception as e:
+                error_msg = f"Неизвестная ошибка при скачивании файла"
+                print(f"❌ {error_msg}: {e}")
+                print(f"📋 Traceback: {traceback.format_exc()}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"{error_msg}: {str(e)}"
                 )
         elif file:
             # Режим 2: Прямая загрузка файла (для маленьких файлов)
