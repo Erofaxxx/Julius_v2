@@ -329,7 +329,7 @@ class CSVAnalysisAgentAPI:
 
     def load_csv_from_file(self, file_path: str) -> pd.DataFrame:
         """
-        Загрузить CSV из пути
+        Загрузить CSV из пути (для больших файлов - без загрузки в память)
 
         Args:
             file_path: Путь к файлу
@@ -337,9 +337,106 @@ class CSVAnalysisAgentAPI:
         Returns:
             DataFrame
         """
-        with open(file_path, 'rb') as f:
-            file_bytes = f.read()
-        return self.load_csv_from_bytes(file_bytes, os.path.basename(file_path))
+        filename = os.path.basename(file_path)
+        self.current_filename = filename
+
+        load_info = {
+            "filename": filename,
+            "steps": [],
+            "warnings": [],
+            "original_shape": None,
+            "final_shape": None,
+            "success": True,
+            "file_format": "csv"
+        }
+
+        # Определяем тип файла по расширению
+        file_ext = os.path.splitext(filename)[1].lower()
+
+        try:
+            # Загрузка в зависимости от формата - напрямую с диска!
+            if file_ext in ['.xlsx', '.xls', '.xlsm']:
+                load_info["file_format"] = "excel"
+                load_info["steps"].append(f"📊 Определён формат: Excel ({file_ext})")
+
+                if file_ext == '.xls' and not XLS_SUPPORT:
+                    raise Exception(f"Формат .xls не поддерживается. Установите: pip install xlrd")
+                if file_ext in ['.xlsx', '.xlsm'] and not EXCEL_SUPPORT:
+                    raise Exception(f"Формат Excel не поддерживается. Установите: pip install openpyxl")
+
+                # Читаем напрямую с диска (не через BytesIO!)
+                df_raw = pd.read_excel(file_path, sheet_name=0)
+                load_info["steps"].append("📥 Загружен первый лист Excel файла с диска")
+            else:
+                # CSV файл - читаем первые байты для определения параметров
+                with open(file_path, 'rb') as f:
+                    sample_bytes = f.read(8192)  # Только первые 8 КБ для анализа
+
+                sep = self._detect_separator(sample_bytes)
+                encoding = self._detect_encoding(sample_bytes)
+
+                load_info["steps"].append(f"🔍 Определён разделитель: '{sep}', кодировка: {encoding}")
+
+                # Читаем напрямую с диска (не через BytesIO!)
+                df_raw = pd.read_csv(file_path, sep=sep, encoding=encoding, on_bad_lines='skip')
+
+            # НЕ ДЕЛАЕМ КОПИЮ для экономии памяти!
+            # self.original_df = df_raw.copy()  # УДАЛЕНО - экономия ~77+ МБ
+            self.original_df = None  # Для больших файлов не храним копию
+
+            load_info["original_shape"] = df_raw.shape
+            load_info["steps"].append(f"📥 Загружено: {df_raw.shape[0]} строк × {df_raw.shape[1]} колонок")
+
+            # Остальная обработка аналогична smart_load_file
+            unnamed_cols = [col for col in df_raw.columns if 'Unnamed' in str(col)]
+            if unnamed_cols:
+                self.data_metadata["has_unnamed_columns"] = True
+                load_info["steps"].append(f"🔍 Обнаружено {len(unnamed_cols)} безымянных колонок")
+
+            if self._is_first_row_header(df_raw):
+                self.data_metadata["first_row_is_header"] = True
+                load_info["steps"].append("🎯 Первая строка - заголовки, преобразуем")
+                new_columns = df_raw.iloc[0].tolist()
+                df_raw.columns = new_columns
+                df_raw = df_raw.iloc[1:].reset_index(drop=True)
+
+            # Очищаем названия колонок
+            df_raw.columns = df_raw.columns.astype(str).str.strip()
+
+            # Удаляем пустые строки
+            rows_before = len(df_raw)
+            df_raw = df_raw.dropna(how='all')
+            rows_removed = rows_before - len(df_raw)
+            if rows_removed > 0:
+                self.data_metadata["rows_removed"] = rows_removed
+                load_info["steps"].append(f"🗑️ Удалено {rows_removed} пустых строк")
+
+            # Удаляем пустые колонки
+            cols_before = len(df_raw.columns)
+            df_raw = df_raw.dropna(axis=1, how='all')
+            cols_removed = cols_before - len(df_raw.columns)
+            if cols_removed > 0:
+                self.data_metadata["cols_removed"] = cols_removed
+                load_info["steps"].append(f"🗑️ Удалено {cols_removed} пустых колонок")
+
+            # Удаляем пустые Unnamed колонки
+            cols_to_drop = []
+            for col in df_raw.columns:
+                if 'Unnamed' in str(col):
+                    if df_raw[col].isna().all() or (df_raw[col].astype(str).str.strip() == '').all():
+                        cols_to_drop.append(col)
+            if cols_to_drop:
+                df_raw = df_raw.drop(columns=cols_to_drop)
+                load_info["steps"].append(f"🗑️ Удалено {len(cols_to_drop)} пустых Unnamed колонок")
+
+            self.current_df = df_raw.reset_index(drop=True)
+            load_info["final_shape"] = self.current_df.shape
+            load_info["steps"].append(f"✅ Итого: {self.current_df.shape[0]} строк × {self.current_df.shape[1]} колонок")
+
+            return self.current_df
+
+        except Exception as e:
+            raise Exception(f"Ошибка при загрузке файла '{filename}': {str(e)}")
 
     def analyze_csv_schema(self, df: pd.DataFrame) -> Dict[str, Any]:
         """

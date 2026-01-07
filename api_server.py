@@ -195,6 +195,12 @@ async def analyze_csv(
         - was_modified: флаг изменения данных
     """
     agent = None
+    # Инициализация переменных для обоих режимов загрузки
+    content_length = 0
+    load_from_disk = False
+    temp_download_path = None
+    file_bytes = None
+
     try:
         # Определяем источник файла
         if file_url:
@@ -230,40 +236,45 @@ async def analyze_csv(
                 print(f"⏳ Начинаем загрузку... (таймаут: 600 сек, streaming: {use_streaming})")
                 download_start = datetime.now()
 
+                # Переменные для отслеживания режима загрузки
+                temp_download_path = None
+                file_bytes = None
+                load_from_disk = False  # Флаг для загрузки напрямую с диска
+
                 if use_streaming:
                     # Streaming загрузка в временный файл на диске
+                    # ВАЖНО: НЕ читаем файл обратно в память!
                     temp_file_id = str(uuid.uuid4())
-                    temp_download_path = TEMP_FILES_DIR / f"download_{temp_file_id}.tmp"
+                    file_ext = os.path.splitext(file_name)[1].lower()
+                    temp_download_path = TEMP_FILES_DIR / f"download_{temp_file_id}{file_ext}"
 
-                    try:
-                        async with httpx.AsyncClient(
-                            timeout=httpx.Timeout(600.0, connect=60.0)
-                        ) as client:
-                            async with client.stream("GET", file_url) as response:
-                                response.raise_for_status()
+                    async with httpx.AsyncClient(
+                        timeout=httpx.Timeout(600.0, connect=60.0)
+                    ) as client:
+                        async with client.stream("GET", file_url) as response:
+                            response.raise_for_status()
 
-                                downloaded_bytes = 0
-                                chunk_size = 1024 * 1024  # 1 МБ chunks
+                            downloaded_bytes = 0
+                            chunk_size = 1024 * 1024  # 1 МБ chunks
 
-                                with open(temp_download_path, 'wb') as f:
-                                    async for chunk in response.aiter_bytes(chunk_size):
-                                        f.write(chunk)
-                                        downloaded_bytes += len(chunk)
-                                        # Логируем прогресс каждые 10 МБ
-                                        if downloaded_bytes % (10 * 1024 * 1024) < chunk_size:
-                                            print(f"   📥 Загружено: {downloaded_bytes / (1024*1024):.1f} МБ")
+                            with open(temp_download_path, 'wb') as f:
+                                async for chunk in response.aiter_bytes(chunk_size):
+                                    f.write(chunk)
+                                    downloaded_bytes += len(chunk)
+                                    # Логируем прогресс каждые 10 МБ
+                                    if downloaded_bytes % (10 * 1024 * 1024) < chunk_size:
+                                        print(f"   📥 Загружено: {downloaded_bytes / (1024*1024):.1f} МБ")
 
-                        # Читаем файл с диска
-                        with open(temp_download_path, 'rb') as f:
-                            file_bytes = f.read()
-                        filename = file_name
+                    filename = file_name
+                    load_from_disk = True  # Будем загружать напрямую с диска
+                    file_size_mb = downloaded_bytes / (1024 * 1024)
 
-                    finally:
-                        # Удаляем временный файл загрузки
-                        if temp_download_path.exists():
-                            temp_download_path.unlink()
+                    download_time = (datetime.now() - download_start).total_seconds()
+                    speed_mbps = file_size_mb / download_time if download_time > 0 else 0
+                    print(f"✓ Файл скачан на диск: {file_size_mb:.2f} МБ за {download_time:.1f} сек ({speed_mbps:.2f} МБ/сек)")
+                    print(f"💾 Режим: загрузка напрямую с диска (экономия RAM)")
                 else:
-                    # Прямая загрузка в память для маленьких файлов
+                    # Прямая загрузка в память для маленьких файлов (<20 МБ)
                     async with httpx.AsyncClient(
                         timeout=httpx.Timeout(600.0, connect=60.0),
                         limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
@@ -273,11 +284,10 @@ async def analyze_csv(
                         file_bytes = response.content
                         filename = file_name
 
-                download_time = (datetime.now() - download_start).total_seconds()
-                file_size_mb = len(file_bytes) / (1024 * 1024)
-                speed_mbps = file_size_mb / download_time if download_time > 0 else 0
-
-                print(f"✓ Файл скачан: {file_size_mb:.2f} МБ за {download_time:.1f} сек ({speed_mbps:.2f} МБ/сек)")
+                    download_time = (datetime.now() - download_start).total_seconds()
+                    file_size_mb = len(file_bytes) / (1024 * 1024)
+                    speed_mbps = file_size_mb / download_time if download_time > 0 else 0
+                    print(f"✓ Файл скачан в память: {file_size_mb:.2f} МБ за {download_time:.1f} сек ({speed_mbps:.2f} МБ/сек)")
                 
             except httpx.TimeoutException as e:
                 error_msg = f"Таймаут при скачивании файла (>600 сек). Файл: {file_name}"
@@ -312,24 +322,31 @@ async def analyze_csv(
             # Режим 2: Прямая загрузка файла (для маленьких файлов)
             file_bytes = await file.read()
             filename = file.filename
+            content_length = len(file_bytes)
             print(f"📤 Получен загруженный файл: {filename} ({len(file_bytes) / (1024*1024):.2f} МБ)")
         else:
             raise HTTPException(
                 status_code=400,
                 detail="Необходимо указать либо file, либо file_url + file_name"
             )
-        
+
         # Проверка формата файла (CSV и Excel)
         allowed_extensions = ['.csv', '.xlsx', '.xls', '.xlsm']
         file_ext = os.path.splitext(filename)[1].lower()
         if file_ext not in allowed_extensions:
+            # Удаляем временный файл если есть
+            if temp_download_path and temp_download_path.exists():
+                temp_download_path.unlink()
             raise HTTPException(
                 status_code=400,
                 detail=f"Неподдерживаемый формат файла. Поддерживаются: {', '.join(allowed_extensions)}"
             )
-        
+
         print(f"✓ Формат файла проверен: {file_ext}")
-        print(f"📊 Размер в памяти: {len(file_bytes) / (1024*1024):.2f} МБ")
+        if file_bytes:
+            print(f"📊 Размер в памяти: {len(file_bytes) / (1024*1024):.2f} МБ")
+        elif temp_download_path:
+            print(f"📊 Размер на диске: {temp_download_path.stat().st_size / (1024*1024):.2f} МБ")
 
         # Парсинг истории если есть
         history = None
@@ -339,6 +356,8 @@ async def analyze_csv(
                 history = json.loads(chat_history)
                 print(f"✓ История чата загружена: {len(history)} сообщений")
             except json.JSONDecodeError:
+                if temp_download_path and temp_download_path.exists():
+                    temp_download_path.unlink()
                 raise HTTPException(
                     status_code=400,
                     detail="Неверный формат chat_history. Требуется валидный JSON."
@@ -349,21 +368,37 @@ async def analyze_csv(
         agent = CSVAnalysisAgentAPI(api_key=OPENROUTER_API_KEY)
         print(f"✓ Агент создан")
 
-        # Загрузка CSV
+        # Загрузка CSV - разные режимы для экономии памяти
         print(f"📂 Начинаем загрузку данных в pandas...")
         load_start = datetime.now()
         try:
-            df = agent.load_csv_from_bytes(file_bytes, filename)
+            if load_from_disk and temp_download_path:
+                # Большой файл - загружаем НАПРЯМУЮ С ДИСКА (экономия ~77+ МБ RAM!)
+                print(f"💾 Режим загрузки: с диска (экономия памяти)")
+                df = agent.load_csv_from_file(str(temp_download_path))
+            else:
+                # Маленький файл - загружаем из памяти (быстрее)
+                print(f"💾 Режим загрузки: из памяти")
+                df = agent.load_csv_from_bytes(file_bytes, filename)
+
             load_time = (datetime.now() - load_start).total_seconds()
             print(f"✓ Данные загружены за {load_time:.2f} сек: {df.shape[0]} строк × {df.shape[1]} колонок")
             print(f"💾 Память DataFrame: {df.memory_usage(deep=True).sum() / (1024*1024):.2f} МБ")
         except Exception as e:
             print(f"❌ Ошибка загрузки данных: {e}")
             print(f"📋 Traceback: {traceback.format_exc()}")
+            # Удаляем временный файл при ошибке
+            if temp_download_path and temp_download_path.exists():
+                temp_download_path.unlink()
             raise HTTPException(
                 status_code=400,
                 detail=f"Ошибка при чтении файла: {str(e)}"
             )
+        finally:
+            # Удаляем временный файл после загрузки в pandas
+            if temp_download_path and temp_download_path.exists():
+                temp_download_path.unlink()
+                print(f"🗑️ Временный файл удалён")
 
         # Выполнение анализа (или автоочистки если query пустой)
         print(f"🧠 Начинаем AI анализ...")
@@ -381,9 +416,11 @@ async def analyze_csv(
 
         # Добавляем информацию о файле
         print(f"📦 Формирование ответа...")
+        # Вычисляем размер файла (file_bytes может быть None для больших файлов)
+        file_size_bytes = len(file_bytes) if file_bytes else int(content_length) if content_length else 0
         result["file_info"] = {
             "filename": filename,
-            "size_bytes": len(file_bytes),
+            "size_bytes": file_size_bytes,
             "rows": df.shape[0],
             "columns": df.shape[1]
         }
