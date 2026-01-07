@@ -210,33 +210,73 @@ async def analyze_csv(
             
             try:
                 # Проверка доступности URL перед скачиванием (HEAD запрос)
+                content_length = 0
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     try:
                         head_response = await client.head(file_url)
-                        content_length = head_response.headers.get('content-length')
-                        if content_length:
-                            file_size_mb = int(content_length) / (1024 * 1024)
+                        content_length_str = head_response.headers.get('content-length')
+                        if content_length_str:
+                            content_length = int(content_length_str)
+                            file_size_mb = content_length / (1024 * 1024)
                             print(f"📊 Размер файла: {file_size_mb:.2f} МБ")
                     except Exception as e:
                         print(f"⚠️ Не удалось получить размер файла: {e}")
-                
-                # Скачиваем файл с увеличенным таймаутом (10 минут)
-                print(f"⏳ Начинаем загрузку... (таймаут: 600 сек)")
+
+                # Для больших файлов используем streaming в временный файл
+                # чтобы не загружать всё в память (критично для серверов с 1 ГБ RAM)
+                STREAM_THRESHOLD = 20 * 1024 * 1024  # 20 МБ - порог для streaming
+                use_streaming = content_length > STREAM_THRESHOLD
+
+                print(f"⏳ Начинаем загрузку... (таймаут: 600 сек, streaming: {use_streaming})")
                 download_start = datetime.now()
-                
-                async with httpx.AsyncClient(
-                    timeout=httpx.Timeout(600.0, connect=60.0),  # 10 мин общий, 1 мин на подключение
-                    limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
-                ) as client:
-                    response = await client.get(file_url)
-                    response.raise_for_status()
-                    file_bytes = response.content
-                    filename = file_name
-                
+
+                if use_streaming:
+                    # Streaming загрузка в временный файл на диске
+                    temp_file_id = str(uuid.uuid4())
+                    temp_download_path = TEMP_FILES_DIR / f"download_{temp_file_id}.tmp"
+
+                    try:
+                        async with httpx.AsyncClient(
+                            timeout=httpx.Timeout(600.0, connect=60.0)
+                        ) as client:
+                            async with client.stream("GET", file_url) as response:
+                                response.raise_for_status()
+
+                                downloaded_bytes = 0
+                                chunk_size = 1024 * 1024  # 1 МБ chunks
+
+                                with open(temp_download_path, 'wb') as f:
+                                    async for chunk in response.aiter_bytes(chunk_size):
+                                        f.write(chunk)
+                                        downloaded_bytes += len(chunk)
+                                        # Логируем прогресс каждые 10 МБ
+                                        if downloaded_bytes % (10 * 1024 * 1024) < chunk_size:
+                                            print(f"   📥 Загружено: {downloaded_bytes / (1024*1024):.1f} МБ")
+
+                        # Читаем файл с диска
+                        with open(temp_download_path, 'rb') as f:
+                            file_bytes = f.read()
+                        filename = file_name
+
+                    finally:
+                        # Удаляем временный файл загрузки
+                        if temp_download_path.exists():
+                            temp_download_path.unlink()
+                else:
+                    # Прямая загрузка в память для маленьких файлов
+                    async with httpx.AsyncClient(
+                        timeout=httpx.Timeout(600.0, connect=60.0),
+                        limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
+                    ) as client:
+                        response = await client.get(file_url)
+                        response.raise_for_status()
+                        file_bytes = response.content
+                        filename = file_name
+
                 download_time = (datetime.now() - download_start).total_seconds()
                 file_size_mb = len(file_bytes) / (1024 * 1024)
                 speed_mbps = file_size_mb / download_time if download_time > 0 else 0
-                
+
                 print(f"✓ Файл скачан: {file_size_mb:.2f} МБ за {download_time:.1f} сек ({speed_mbps:.2f} МБ/сек)")
                 
             except httpx.TimeoutException as e:
